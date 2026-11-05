@@ -310,6 +310,65 @@ fn two_mods_cannot_ship_the_same_package() {
         lock.contains("dependencies = [\n \"boost-engine\",\n \"second-engine\",\n \"serde\",\n]")
     );
 }
+/// The boost mod with a second crate, `core` (package `boost-core`), whose manifest gets `deps`.
+fn with_core(deps: &str) -> Fixture {
+    let f = fixture();
+    let core = f.mods.join("boost/core");
+    fs::create_dir_all(core.join("src")).unwrap();
+    fs::write(
+        core.join("Cargo.toml"),
+        format!("[package]\nname = \"boost-core\"\nversion = \"0.2.0\"\nedition = \"2024\"\n\n[dependencies]\n{deps}"),
+    )
+    .unwrap();
+    fs::write(core.join("src/lib.rs"), "pub fn base() -> i64 {\n    2\n}\n").unwrap();
+    manifest(&f, "boost", |v| {
+        let mut core = toml::Table::new();
+        core.insert("id".into(), "core".into());
+        core.insert("path".into(), "core".into());
+        core.insert("dependent".into(), "native-game".into());
+        v["crate"].as_array_mut().unwrap().push(core.into());
+    });
+    f
+}
+#[test]
+fn a_bundle_crate_depends_on_another_crate_of_its_mod() {
+    let f = with_core("");
+    engine_manifest(
+        &f,
+        &format!("{ENGINE}serde_json = \"1\"\nboost-core = {{ path = \"../core\" }}\n"),
+    );
+    f.append(
+        "mods/boost/engine/src/lib.rs",
+        "\n#[test]\nfn the_base_comes_from_the_mods_other_crate() {\n    assert_eq!(boost(boost_core::base()), 42);\n}\n",
+    );
+    let result = f.run("check");
+    assert_eq!(result["crates"], 2);
+    let stdout = result["cargo_stdout"].as_str().unwrap();
+    assert!(stdout.contains("the_base_comes_from_the_mods_other_crate ... ok"), "{stdout}");
+    let lock = fs::read_to_string(f.out.join("Cargo.lock")).unwrap();
+    assert!(
+        lock.contains("name = \"boost-engine\"\nversion = \"0.1.0\"\ndependencies = [\n \"boost-core\",\n \"serde_json\",\n]"),
+        "{lock}"
+    );
+    let plan = build_plan(&f.root, &f.mods).unwrap();
+    let engine = plan.crates.iter().find(|c| c.crate_id == "engine").unwrap();
+    assert_eq!(engine.lock_dependencies, ["boost-core", "serde_json"]);
+    // A path names a crate of the same mod by id, by its package's name, and not in a cycle.
+    for (deps, core_deps, message) in [
+        ("boost-core = { path = \"../missing\" }", "", "'../missing' is not another crate of boost; a path names one of its crates by id: engine, core"),
+        ("boost-core = { path = \"../engine\" }", "", "'../engine' is not another crate of boost"),
+        ("core = { path = \"../core\" }", "", "crate 'core' is the package 'boost-core'"),
+        ("boost-core = { path = \"core\" }", "", "must name another crate of the same mod"),
+        ("boost-core = { path = \"../core/sub\" }", "", "must name another crate of the same mod"),
+        ("boost-core = { path = \"../core\" }", "boost-engine = { path = \"../engine\" }\n", "cycle (engine -> core -> engine)"),
+    ] {
+        let f = with_core(core_deps);
+        engine_manifest(&f, &format!("{ENGINE}{deps}\n"));
+        let e = failure(&f, "E_CRATE_DEPENDENCY");
+        assert!(e.message.contains(message), "{deps}: {e:?}");
+        assert_eq!(e.mod_id.as_deref(), Some("boost"));
+    }
+}
 #[test]
 fn post_build_steps_name_a_bin_of_the_mods_own_crate() {
     for (key, value) in [("crate", "other"), ("bin", "../bake"), ("bin", "missing")] {

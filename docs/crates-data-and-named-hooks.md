@@ -92,7 +92,17 @@ only `version`, `features`, `default-features` and `optional`. This applies to `
 `[dev-dependencies]` and `[build-dependencies]`. Each must match a registry package that is already
 in the workspace's `Cargo.lock`; the highest matching locked version is used. Horizon's lock file is
 the allow list. A crate cannot depend on the game crate (Cargo forbids the cycle) or on any path or
-git crate. The game glue stays in helpers and support modules, and the heavy logic goes in the crate.
+git crate, except another crate of the same mod. The game glue stays in helpers and support modules,
+and the heavy logic goes in the crate.
+
+A mod's crates may depend on each other: `<package> = { path = "../<crate id>" }` (with `features`,
+`default-features`, `optional` or `version` beside it if needed). The stage puts every crate of a
+mod at `native-crates/<mod-id>/<crate-id>/`, so the path names the other crate by its id, whatever
+folder it has in the bundle, and the dependency's name must be that crate's package name. A mod
+splits a large crate this way so that each part compiles in its own `rustc`, in parallel, and an
+unchanged part stays built. Rejected with `E_CRATE_DEPENDENCY`: any other path (`../x` naming no
+other crate of the mod, a deeper path, the crate itself), a dependency named other than the crate's
+package, and a cycle among the mod's crates, which the message spells out (`engine -> core -> engine`).
 
 The crate's own data lives inside its folder and is copied with it:
 `include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/table.json"))`.
@@ -116,7 +126,7 @@ Dependency problems are `E_CRATE_DEPENDENCY`, for example
 folders or files, are `E_INVALID_PATH`.
 
 Cargo rebuilds a crate only when its sources or dependencies change. A bundle crate depends only on
-registry crates, so editing the mod's helpers or toggling another mod leaves it built. Its staged
+registry crates and its own mod's crates, so editing the mod's helpers or toggling another mod leaves it built. Its staged
 files keep their mtimes, which the integration test checks. The game crate still recompiles, but it
 no longer contains the crate's code.
 

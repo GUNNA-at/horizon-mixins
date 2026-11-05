@@ -283,9 +283,32 @@ pub fn plan(
     for bundle in mods {
         let mod_id = &bundle.manifest.info.id;
         let mut packages_by_crate = BTreeMap::new();
+        // Every crate of the mod first: one may depend on another (`path = "../<crate id>"`).
+        let mut infos = Vec::new();
         for (spec, files) in bundle.manifest.crates.iter().zip(&bundle.crates) {
+            infos.push(
+                inspect_crate(files).map_err(|(code, m)| crate_error(bundle, &spec.id, code, m))?,
+            );
+        }
+        if let Some(cycle) = sibling_cycle(&bundle.manifest.crates, &infos) {
+            return Err(crate_error(
+                bundle,
+                &cycle[0],
+                "E_CRATE_DEPENDENCY",
+                format!(
+                    "{mod_id}'s crates depend on each other in a cycle ({}), which Cargo refuses",
+                    cycle.join(" -> ")
+                ),
+            ));
+        }
+        for ((spec, files), info) in bundle
+            .manifest
+            .crates
+            .iter()
+            .zip(&bundle.crates)
+            .zip(&infos)
+        {
             let fail = |code: &str, message: String| crate_error(bundle, &spec.id, code, message);
-            let info = inspect_crate(files).map_err(|(code, m)| fail(code, m))?;
             let key = normalized(&info.package);
             if let Some(owner) = taken.get(&key) {
                 return Err(fail(
@@ -351,6 +374,40 @@ pub fn plan(
                 };
                 lock_dependencies.insert((name.clone(), version), text);
             }
+            // Another crate of the mod: staged beside this one, under its id.
+            for (name, id) in &info.siblings {
+                let other = bundle
+                    .manifest
+                    .crates
+                    .iter()
+                    .position(|c| c.id == *id && c.id != spec.id);
+                let Some(other) = other else {
+                    return Err(fail(
+                        "E_CRATE_DEPENDENCY",
+                        format!(
+                            "{name}: '../{id}' is not another crate of {mod_id}; a path names one \
+                             of its crates by id: {}",
+                            bundle
+                                .manifest
+                                .crates
+                                .iter()
+                                .map(|c| c.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                };
+                let package = &infos[other].package;
+                if package != name {
+                    return Err(fail(
+                        "E_CRATE_DEPENDENCY",
+                        format!("{name}: crate '{id}' is the package '{package}'; name it so"),
+                    ));
+                }
+                let version = semver::Version::parse(&infos[other].version)
+                    .map_err(|e| fail("E_CRATE", e.to_string()))?;
+                lock_dependencies.insert((name.clone(), version), name.clone());
+            }
             let path = format!("{CRATES}/{mod_id}/{}", spec.id);
             let depth = Path::new(dependent_manifest)
                 .parent()
@@ -361,12 +418,12 @@ pub fn plan(
                     .extras
                     .insert(format!("{path}/{name}"), bytes.clone());
             }
-            packages_by_crate.insert(spec.id.as_str(), (info.package.clone(), info.bins));
+            packages_by_crate.insert(spec.id.as_str(), (info.package.clone(), info.bins.clone()));
             planned.crates.push(PlannedCrate {
                 mod_id: mod_id.clone(),
                 crate_id: spec.id.clone(),
-                package: info.package,
-                version: info.version,
+                package: info.package.clone(),
+                version: info.version.clone(),
                 path,
                 dependent: dependent.to_string(),
                 dependent_manifest: dependent_manifest.clone(),
@@ -480,7 +537,48 @@ struct CrateInfo {
     package: String,
     version: String,
     dependencies: Vec<(String, semver::VersionReq)>,
+    /// Dependencies on the mod's other crates: the dependency's name and the crate's id.
+    siblings: Vec<(String, String)>,
     bins: BTreeSet<String>,
+}
+/// A cycle among a mod's crates through their dependencies on each other, as crate ids from the
+/// first back to it. Ids that name no other crate of the mod (or the crate itself) are left to
+/// the caller's check.
+fn sibling_cycle(crates: &[manifest::Crate], infos: &[CrateInfo]) -> Option<Vec<String>> {
+    fn visit(
+        i: usize,
+        crates: &[manifest::Crate],
+        infos: &[CrateInfo],
+        state: &mut [u8],
+        path: &mut Vec<usize>,
+    ) -> Option<Vec<String>> {
+        // 1: on the path being walked, 2: walked, with no cycle through it.
+        match state[i] {
+            2 => return None,
+            1 => {
+                let start = path.iter().position(|&p| p == i).unwrap_or(0);
+                let mut cycle: Vec<String> =
+                    path[start..].iter().map(|&p| crates[p].id.clone()).collect();
+                cycle.push(crates[i].id.clone());
+                return Some(cycle);
+            }
+            _ => {}
+        }
+        state[i] = 1;
+        path.push(i);
+        for (_, id) in &infos[i].siblings {
+            if let Some(j) = crates.iter().position(|c| c.id == *id).filter(|&j| j != i) {
+                if let Some(cycle) = visit(j, crates, infos, state, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+        path.pop();
+        state[i] = 2;
+        None
+    }
+    let mut state = vec![0u8; crates.len()];
+    (0..crates.len()).find_map(|i| visit(i, crates, infos, &mut state, &mut Vec::new()))
 }
 type Invalid = (&'static str, String);
 fn inspect_crate(files: &BTreeMap<String, Vec<u8>>) -> std::result::Result<CrateInfo, Invalid> {
@@ -579,6 +677,7 @@ fn inspect_crate(files: &BTreeMap<String, Vec<u8>>) -> std::result::Result<Crate
         }
     }
     let mut dependencies = Vec::new();
+    let mut siblings = Vec::new();
     for kind in DEPENDENCY_TABLES {
         let Some(table) = doc.get(kind) else {
             continue;
@@ -594,14 +693,31 @@ fn inspect_crate(files: &BTreeMap<String, Vec<u8>>) -> std::result::Result<Crate
                     if let Some(key) = spec.keys().find(|k| {
                         !matches!(
                             k.as_str(),
-                            "version" | "features" | "default-features" | "optional"
+                            "version" | "features" | "default-features" | "optional" | "path"
                         )
                     }) {
                         return Err(dependency(format!(
                             "'{key}' is not allowed; bundle crates take plain registry \
                              dependencies from Horizon's Cargo.lock (version, features, \
-                             default-features, optional)"
+                             default-features, optional), or another crate of their mod \
+                             (path = \"../<crate id>\")"
                         )));
+                    }
+                    // Another crate of the same mod: the stage puts each at
+                    // `native-crates/<mod id>/<crate id>`, so `../<crate id>` reaches it there.
+                    if let Some(path) = spec.get("path") {
+                        let id = path
+                            .as_str()
+                            .and_then(|p| p.strip_prefix("../"))
+                            .filter(|id| manifest::valid_id(id))
+                            .ok_or_else(|| {
+                                dependency(format!(
+                                    "path {path} must name another crate of the same mod, as \
+                                     \"../<crate id>\""
+                                ))
+                            })?;
+                        siblings.push((dep.clone(), id.to_string()));
+                        continue;
                     }
                     spec.get("version")
                         .and_then(|v| v.as_str())
@@ -618,6 +734,7 @@ fn inspect_crate(files: &BTreeMap<String, Vec<u8>>) -> std::result::Result<Crate
         package: name.to_string(),
         version: version.to_string(),
         dependencies,
+        siblings,
         bins,
     })
 }
